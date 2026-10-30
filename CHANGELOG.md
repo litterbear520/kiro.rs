@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 📊 Prompt Cache 计量
+
+> 相关：[issue #101](https://github.com/ZyphrZero/kiro.rs/issues/101)。
+
+- 修复客户端把断点打在 assistant prefill 上时，本地缓存计量按含 prefill 的请求计算指纹、下一轮永远无法命中的问题。converter 本来就不把 prefill 发给上游；现在计量与 converter 共用同一个去 prefill 的判断，prefill 上的合法断点移到剩下的最后一个可缓存块，非法断点随 prefill 一起丢弃。新版 Claude Code 对 Sonnet 5、Opus 4.8 等模型会发 prefill，修复前每轮的对话历史都按缓存写入计。
+
 ## [0.9.3] - 2026-10-26
 
 主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。

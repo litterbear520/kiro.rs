@@ -1,5 +1,7 @@
 //! Real HTTP fixtures for gateway regressions and repeatable latency measurements.
 use super::{
+    cache_metering::CacheMeter,
+    converter::get_context_window_size,
     handlers::{post_messages, post_messages_cc},
     middleware::{AppState, KeyContext},
     openai::post_chat_completions,
@@ -62,6 +64,9 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// 和生产一样：不发 tokenUsage，只发内容和按请求体大小换算的 contextUsage，
+    /// 用量全部来自本地模拟缓存。
+    Simulated,
 }
 
 struct Fixture {
@@ -137,7 +142,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let close_headers = Arc::new(AtomicUsize::new(0));
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upstream_body: Bytes| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -151,6 +156,13 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if matches!(mode, Mode::Simulated) {
+                let window = get_context_window_size(SIMULATED_MODEL) as f64;
+                let percentage = upstream_body.len() as f64 / 4.0 / window * 100.0;
+                let mut bytes = frame("assistantResponseEvent", json!({"content": "ok"})).to_vec();
+                bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage": percentage})));
+                return Response::new(Body::from(bytes));
+            }
             if matches!(mode, Mode::Large) {
                 let frames = (0..18000).map(|_| frame("assistantResponseEvent", json!({"content": "x".repeat(1024)})));
                 return Response::new(Body::from_stream(stream::iter(frames.map(Ok::<_, Infallible>))));
@@ -269,20 +281,8 @@ async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
             Json(serde_json::from_value(req).unwrap()),
         )
         .await
-    } else if endpoint == "cc" {
-        post_messages_cc(
-            axum::extract::State(state),
-            Extension(key()),
-            Json(serde_json::from_value(req).unwrap()),
-        )
-        .await
     } else {
-        post_messages(
-            axum::extract::State(state),
-            Extension(key()),
-            Json(serde_json::from_value(req).unwrap()),
-        )
-        .await
+        send_messages(state, endpoint, req).await
     }
 }
 
@@ -697,4 +697,191 @@ async fn gateway_latency_measurement() {
             f.calls.load(Ordering::Relaxed)
         );
     }
+}
+
+const SIMULATED_MODEL: &str = "claude-sonnet-4-5";
+const SESSION_USER_ID: &str = "user_fixture_account__session_0f6c9a52-3c1e-4f43-9d8a-6a1d2b7c9e01";
+
+fn metered(f: &Fixture) -> AppState {
+    f.state
+        .clone()
+        .with_cache_meter(Some(Arc::new(CacheMeter::new(None))))
+}
+
+async fn send_messages(state: AppState, endpoint: &str, req: serde_json::Value) -> Response {
+    let req = serde_json::from_value(req).unwrap();
+    if endpoint == "cc" {
+        post_messages_cc(axum::extract::State(state), Extension(key()), Json(req)).await
+    } else {
+        post_messages(axum::extract::State(state), Extension(key()), Json(req)).await
+    }
+}
+
+/// 读完整条 SSE，返回 message_start 和 message_delta 的 usage（没有 message_delta 时为 None）。
+async fn stream_usage(response: Response) -> (serde_json::Value, Option<serde_json::Value>) {
+    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let (mut start, mut delta) = (None, None);
+    for event in text.split("\n\n") {
+        let Some(data) = event.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        match data["type"].as_str() {
+            Some("message_start") => start = Some(data["message"]["usage"].clone()),
+            Some("message_delta") => delta = Some(data["usage"].clone()),
+            _ => {}
+        }
+    }
+    (
+        start.unwrap_or_else(|| panic!("no message_start: {text}")),
+        delta,
+    )
+}
+
+/// `[input_tokens, cache_creation_input_tokens, cache_read_input_tokens]`
+fn usage_split(usage: &serde_json::Value) -> [i64; 3] {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .map(|field| {
+        usage[field]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{field} missing: {usage}"))
+    })
+}
+
+fn ephemeral() -> serde_json::Value {
+    json!({"type": "ephemeral"})
+}
+
+fn claude_code_request(
+    mut messages: Vec<serde_json::Value>,
+    round: usize,
+    prefill_cache_control: serde_json::Value,
+) -> serde_json::Value {
+    messages.push(json!({"role": "assistant", "content": [
+        {"type": "text", "text": format!("prefill {round}"), "cache_control": prefill_cache_control}
+    ]}));
+    json!({
+        "model": SIMULATED_MODEL,
+        "max_tokens": 64,
+        "stream": true,
+        "metadata": {"user_id": SESSION_USER_ID},
+        "system": [{"type": "text", "text": "You are Claude Code. ".repeat(50), "cache_control": ephemeral()}],
+        "tools": [{"name": "Read", "description": "Read a file", "input_schema": {
+            "type": "object", "properties": {"file_path": {"type": "string"}}
+        }}],
+        "messages": messages,
+    })
+}
+
+/// Claude Code 聊天的第 `round` 轮（从 1 开始）。和新版 Claude Code 一样，末尾是一条
+/// 带断点的 prefill；下一轮里这条 prefill 已换成真实回复。
+fn chat_round(round: usize, prefill_cache_control: serde_json::Value) -> serde_json::Value {
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "text", "text": "Read this repository and explain it. ".repeat(200)}
+    ]})];
+    for turn in 1..round {
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": format!("Reply {turn}. ").repeat(20)}
+        ]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "text", "text": format!("Question {}. ", turn + 1).repeat(20)}
+        ]}));
+    }
+    claude_code_request(messages, round, prefill_cache_control)
+}
+
+/// Claude Code 工具循环的第 `round` 轮：每条回复带 thinking 和 tool_use，
+/// 每条新的 user 消息只有 tool_result。
+fn tool_loop_round(round: usize) -> serde_json::Value {
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "text", "text": "Fix the failing test. ".repeat(200)}
+    ]})];
+    for step in 1..=round {
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": format!("Look at file {step}."), "signature": "fixture"},
+            {"type": "tool_use", "id": format!("toolu_{step}"), "name": "Read",
+             "input": {"file_path": format!("/src/{step}.rs")}}
+        ]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": format!("toolu_{step}"),
+             "content": format!("Contents of file {step}. ").repeat(20)}
+        ]}));
+    }
+    claude_code_request(messages, round, ephemeral())
+}
+
+/// 两种 Claude Code 请求形态：聊天和工具循环。
+fn claude_code_shapes() -> [(&'static str, fn(usize) -> serde_json::Value); 2] {
+    [
+        ("chat", |round| chat_round(round, ephemeral())),
+        ("tool loop", tool_loop_round),
+    ]
+}
+
+/// converter 发给 Kiro 前会丢掉 prefill。计量必须对同样的内容算指纹，否则上一轮的
+/// 指纹在下一轮永远对不上，每轮都整段按缓存写入算。
+#[tokio::test]
+async fn gateway_prefill_breakpoint_reads_earlier_rounds_from_cache() {
+    for endpoint in ["messages", "cc"] {
+        for (shape, build) in claude_code_shapes() {
+            let f = fixture(Mode::Simulated).await;
+            let state = metered(&f);
+            let mut previous = None;
+            for round in 1..=4 {
+                let (_, delta) =
+                    stream_usage(send_messages(state.clone(), endpoint, build(round)).await).await;
+                let [input, creation, read] = usage_split(&delta.expect("message_delta"));
+                let at = format!("{endpoint} {shape} round {round}");
+                assert_eq!(input, 0, "{at}: the breakpoint covers the whole prompt");
+                // 本轮的读取约等于上一轮的读取加写入。两轮的 total 来自各自的 contextUsage
+                // 换算，比例略有出入，留 10% 余量。
+                if let Some((previous_read, previous_creation)) = previous {
+                    let expected: i64 = previous_read + previous_creation;
+                    assert!(
+                        (read - expected).abs() * 10 <= expected,
+                        "{at}: read {read}, previous round read {previous_read} and wrote {previous_creation}"
+                    );
+                    assert!(
+                        creation < read,
+                        "{at}: only the new turn is written, creation {creation} read {read}"
+                    );
+                }
+                previous = Some((read, creation));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_request_without_breakpoints_reports_plain_input() {
+    let f = fixture(Mode::Simulated).await;
+    let req = json!({
+        "model": SIMULATED_MODEL, "max_tokens": 64, "stream": true,
+        "metadata": {"user_id": SESSION_USER_ID},
+        "messages": [{"role": "user", "content": "Read this repository and explain it. ".repeat(50)}],
+    });
+    let (start, delta) = stream_usage(send_messages(metered(&f), "messages", req).await).await;
+    for usage in [start, delta.expect("message_delta")] {
+        let [input, creation, read] = usage_split(&usage);
+        assert!(input > 0 && creation == 0 && read == 0, "usage {usage}");
+    }
+}
+
+/// prefill 上的非法 cache_control 随 prefill 一起丢掉，不能让整次请求放弃计量。
+#[tokio::test]
+async fn gateway_invalid_breakpoint_on_prefill_keeps_metering() {
+    let f = fixture(Mode::Simulated).await;
+    let req = chat_round(1, json!({"type": "ephemeral", "ttl": "2h"}));
+    let (_, delta) = stream_usage(send_messages(metered(&f), "messages", req).await).await;
+    let [_, creation, _] = usage_split(&delta.expect("message_delta"));
+    assert!(creation > 0, "the system breakpoint is still metered");
 }

@@ -715,6 +715,21 @@ fn sorted_ids(ids: &std::collections::HashSet<String>) -> Vec<String> {
     ids
 }
 
+/// 去掉末尾的 assistant prefill：截断到最后一条 user（含）。没有 user 消息时返回 `None`。
+///
+/// Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持，所以发给上游的历史不含它。
+/// CacheMeter 按同一视图计算指纹，两边必须共用这一个判断。
+pub(crate) fn without_prefill(
+    messages: &[super::types::Message],
+) -> Option<&[super::types::Message]> {
+    if messages.last().is_some_and(|m| m.role != "user") {
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user")?;
+        Some(&messages[..=last_user_idx])
+    } else {
+        Some(messages)
+    }
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 /// 便捷入口（测试用）：默认按 ClaudeCode 模式转换。
 #[cfg(test)]
@@ -753,18 +768,10 @@ pub(crate) fn convert_request_with_purpose(
     }
 
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+    let messages = without_prefill(&req.messages).ok_or(ConversionError::EmptyMessages)?;
+    if messages.len() < req.messages.len() {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
-        let last_user_idx = req
-            .messages
-            .iter()
-            .rposition(|m| m.role == "user")
-            .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
-    } else {
-        &req.messages
-    };
+    }
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId

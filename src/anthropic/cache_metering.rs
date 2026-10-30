@@ -1182,8 +1182,19 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
     }
 
     // 3. messages (按顺序遍历)
-    let total_messages = req.messages.len();
-    for (m_idx, msg) in req.messages.iter().enumerate() {
+    // 与 converter 一致，先去掉末尾的 prefill：指纹必须和发给上游的内容一致。
+    // 否则本轮记下的是「历史 + prefill」，下一轮 prefill 已换成真实回复，永远命中不了。
+    let messages = super::converter::without_prefill(&req.messages).unwrap_or(&req.messages);
+    let prefill_cache_control = req.messages[messages.len()..]
+        .iter()
+        .filter_map(|msg| msg.content.as_array())
+        .flatten()
+        .filter_map(|v| v.get("cache_control"))
+        .filter_map(|raw| serde_json::from_value::<CacheControl>(raw.clone()).ok())
+        .filter(|cc| validated_ttl(cc).is_some())
+        .last();
+    let total_messages = messages.len();
+    for (m_idx, msg) in messages.iter().enumerate() {
         let is_tool_result = match &msg.content {
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -1233,6 +1244,16 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // prefill 上的断点（Claude Code 打在这里）移到剩下的最后一个可缓存块，
+    // 只在那个块原本没有断点时才移；非法的断点随 prefill 一起丢弃。
+    if let Some(cache_control) = prefill_cache_control {
+        if let Some(block) = blocks.iter_mut().rev().find(|b| b.cacheable) {
+            if block.cache_control.is_none() && !block.invalid_cache_control {
+                block.cache_control = Some(cache_control);
+            }
         }
     }
 
