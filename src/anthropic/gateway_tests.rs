@@ -827,6 +827,22 @@ fn claude_code_shapes() -> [(&'static str, fn(usize) -> serde_json::Value); 2] {
     ]
 }
 
+/// new-api 只在 message_delta 的字段大于 0 时才覆盖 message_start 的值：开头非 0 的
+/// 字段结尾也必须非 0，开头也不能带结尾报为 0 的估算值，否则开头的值会留下来。
+fn assert_same_split(at: &str, start: &serde_json::Value, delta: &serde_json::Value) {
+    let (start, delta) = (usage_split(start), usage_split(delta));
+    for (field, (s, d)) in ["input", "creation", "read"]
+        .iter()
+        .zip(start.into_iter().zip(delta))
+    {
+        assert_eq!(
+            s > 0,
+            d > 0,
+            "{at}: {field} is {s} at start, {d} at the end"
+        );
+    }
+}
+
 /// converter 发给 Kiro 前会丢掉 prefill。计量必须对同样的内容算指纹，否则上一轮的
 /// 指纹在下一轮永远对不上，每轮都整段按缓存写入算。
 #[tokio::test]
@@ -862,6 +878,35 @@ async fn gateway_prefill_breakpoint_reads_earlier_rounds_from_cache() {
 }
 
 #[tokio::test]
+async fn gateway_message_start_reports_the_same_split_as_message_delta() {
+    for endpoint in ["messages", "cc"] {
+        for (shape, build) in claude_code_shapes() {
+            let f = fixture(Mode::Simulated).await;
+            let state = metered(&f);
+            for round in 1..=4 {
+                let (start, delta) =
+                    stream_usage(send_messages(state.clone(), endpoint, build(round)).await).await;
+                let at = format!("{endpoint} {shape} round {round}");
+                assert_same_split(&at, &start, &delta.expect("message_delta"));
+            }
+        }
+    }
+}
+
+/// 流中途断开（Claude Code 按 Esc、上游断开）时收不到 message_delta，new-api 只能按
+/// message_start 计费。它必须已经是缓存拆分，而不是整段 prompt 按全价的估算。
+#[tokio::test]
+async fn gateway_interrupted_stream_reported_the_cache_split_at_start() {
+    let f = fixture(Mode::Interrupted).await;
+    let (start, _) =
+        stream_usage(send_messages(metered(&f), "messages", chat_round(1, ephemeral())).await)
+            .await;
+    let [input, creation, read] = usage_split(&start);
+    assert_eq!((input, read), (0, 0), "start usage {start}");
+    assert!(creation > 0, "start usage {start}");
+}
+
+#[tokio::test]
 async fn gateway_request_without_breakpoints_reports_plain_input() {
     let f = fixture(Mode::Simulated).await;
     let req = json!({
@@ -881,7 +926,9 @@ async fn gateway_request_without_breakpoints_reports_plain_input() {
 async fn gateway_invalid_breakpoint_on_prefill_keeps_metering() {
     let f = fixture(Mode::Simulated).await;
     let req = chat_round(1, json!({"type": "ephemeral", "ttl": "2h"}));
-    let (_, delta) = stream_usage(send_messages(metered(&f), "messages", req).await).await;
-    let [_, creation, _] = usage_split(&delta.expect("message_delta"));
+    let (start, delta) = stream_usage(send_messages(metered(&f), "messages", req).await).await;
+    let delta = delta.expect("message_delta");
+    let [_, creation, _] = usage_split(&delta);
     assert!(creation > 0, "the system breakpoint is still metered");
+    assert_same_split("invalid prefill breakpoint", &start, &delta);
 }

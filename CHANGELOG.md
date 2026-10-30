@@ -6,11 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### 📊 Prompt Cache 计量
+### 📊 Prompt Cache 计量与流式 usage
 
-> 相关：[issue #101](https://github.com/ZyphrZero/kiro.rs/issues/101)。
+> 相关：[issue #101](https://github.com/ZyphrZero/kiro.rs/issues/101)、[issue #111](https://github.com/ZyphrZero/kiro.rs/issues/111)。
 
 - 修复客户端把断点打在 assistant prefill 上时，本地缓存计量按含 prefill 的请求计算指纹、下一轮永远无法命中的问题。converter 本来就不把 prefill 发给上游；现在计量与 converter 共用同一个去 prefill 的判断，prefill 上的合法断点移到剩下的最后一个可缓存块，非法断点随 prefill 一起丢弃。新版 Claude Code 对 Sonnet 5、Opus 4.8 等模型会发 prefill，修复前每轮的对话历史都按缓存写入计。
+- 流式 `message_start` 的 usage 改为与 `message_delta` 相同的 CacheMeter 拆分，`/v1/messages` 与 `/cc/v1/messages` 一起生效。此前开头报未拆分的估算输入、结尾报 `input_tokens=0`，new-api 等只在结尾值大于 0 时才覆盖的下游会留下估算值，按全价重复计费；流中途断开、收不到 `message_delta` 时，下游也只能按开头的值计费。
 
 ## [0.9.3] - 2026-10-26
 

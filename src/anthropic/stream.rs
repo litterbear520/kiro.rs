@@ -1565,7 +1565,14 @@ impl StreamContext {
     }
 
     /// 生成 message_start 事件
+    ///
+    /// usage 按请求估算的 total 做和 message_delta 相同的 CacheMeter 拆分。下游
+    /// （如 new-api）只在 message_delta 的字段大于 0 时才覆盖开头的值：开头若报
+    /// 未拆分的估算 input，结尾报 input=0 时估算值会留下来被重复计费。流中途断开、
+    /// 收不到 message_delta 时，下游也只能按这里的值计费。
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) =
+            self.cache_usage.split_against_total(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -1577,10 +1584,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens
                 }
             }
         })
