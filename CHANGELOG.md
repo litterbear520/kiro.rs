@@ -12,6 +12,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - 修复客户端把断点打在 assistant prefill 上时，本地缓存计量按含 prefill 的请求计算指纹、下一轮永远无法命中的问题。converter 本来就不把 prefill 发给上游；现在计量与 converter 共用同一个去 prefill 的判断，prefill 上的合法断点移到剩下的最后一个可缓存块，非法断点随 prefill 一起丢弃。新版 Claude Code 对 Sonnet 5、Opus 4.8 等模型会发 prefill，修复前每轮的对话历史都按缓存写入计。
 - 流式 `message_start` 的 usage 改为与 `message_delta` 相同的 CacheMeter 拆分，`/v1/messages` 与 `/cc/v1/messages` 一起生效。此前开头报未拆分的估算输入、结尾报 `input_tokens=0`，new-api 等只在结尾值大于 0 时才覆盖的下游会留下估算值，按全价重复计费；流中途断开、收不到 `message_delta` 时，下游也只能按开头的值计费。
+- 同时声明原生 `web_search` 和普通工具的流式请求走 web_search loop，它的 `message_start` 也改为相同的缓存拆分；首轮缓存只计算一次，同一份结果给起始事件和首轮结算。此前这条路径开头仍报未拆分的估算输入，和上一条是同一类重复计费。
+- 顶层自动缓存的断点改为落在最后一个可缓存 block（包括当前 user），与 Anthropic 一致。此前断点故意避开当前 user，每轮最后一条 user 先按普通输入计、下一轮再按缓存写入计。
+- 本地输出 token 估算改为按字符累计、最后换算一次，流式、非流式和 web_search loop 共用同一个估算器。此前流式按事件分别取整、每个事件至少 1 token，事件越碎输出越多（输出单价高于输入），非流式又用另一套估算。
 
 ## [0.9.3] - 2026-10-26
 

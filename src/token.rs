@@ -224,30 +224,67 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
+/// 输出 token 的本地估算（provider 不下发 usage 时用）
+///
+/// 按字符累计、最后换算一次，结果只取决于输出内容，不随流式事件分块变化，
+/// 流式、非流式和 web_search loop 共用这一套口径：中文约 1.5 字符/token，
+/// 其余约 4 字符/token，每个 redacted_thinking 固定 8 token，结果至少为 1。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutputTokenEstimator {
+    chinese_chars: u64,
+    other_chars: u64,
+    fixed_tokens: u64,
+}
+
+impl OutputTokenEstimator {
+    /// 累计一段输出文本（正文、thinking 或工具参数 JSON）
+    pub(crate) fn add_text(&mut self, text: &str) {
+        for c in text.chars() {
+            if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
+                self.chinese_chars += 1;
+            } else {
+                self.other_chars += 1;
+            }
+        }
+    }
+
+    /// redacted_thinking 内容不可见，按固定 8 token 计
+    pub(crate) fn add_redacted_thinking(&mut self) {
+        self.fixed_tokens += 8;
+    }
+
+    pub(crate) fn tokens(&self) -> i32 {
+        let chinese_tokens = (self.chinese_chars * 2).div_ceil(3);
+        let other_tokens = self.other_chars.div_ceil(4);
+        let total = chinese_tokens + other_tokens + self.fixed_tokens;
+        total.clamp(1, i32::MAX as u64) as i32
+    }
+}
+
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
-    let mut total = 0;
+    let mut estimator = OutputTokenEstimator::default();
 
     for block in content {
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-            total += count_tokens(text) as i32;
+            estimator.add_text(text);
         }
         if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
-            total += count_tokens(thinking) as i32;
+            estimator.add_text(thinking);
         }
         if block.get("type").and_then(|v| v.as_str()) == Some("redacted_thinking") {
-            total += 8;
+            estimator.add_redacted_thinking();
         }
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             // 工具调用开销
             if let Some(input) = block.get("input") {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
-                total += count_tokens(&input_str) as i32;
+                estimator.add_text(&input_str);
             }
         }
     }
 
-    total.max(1)
+    estimator.tokens()
 }
 
 /// 从 contextUsage 换算出的上下文总量里扣掉本轮输出，得到真正的 input 口径。

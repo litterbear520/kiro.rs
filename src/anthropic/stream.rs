@@ -1420,8 +1420,10 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 上游 metadataEvent.tokenUsage 的精确最终快照。
     pub provider_token_usage: Option<TokenUsage>,
-    /// 输出 tokens 累计
+    /// 输出 tokens 的本地估算，由 `output_estimator` 换算而来
     pub output_tokens: i32,
+    /// 输出字符累计；每次累计后整体换算一次，不按事件分别取整
+    output_estimator: crate::token::OutputTokenEstimator,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1538,6 +1540,7 @@ impl StreamContext {
             context_input_tokens: None,
             provider_token_usage: None,
             output_tokens: 0,
+            output_estimator: crate::token::OutputTokenEstimator::default(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1712,6 +1715,12 @@ impl StreamContext {
         }
     }
 
+    /// 累计一段输出文本并刷新 `output_tokens`
+    fn add_output_text(&mut self, text: &str) {
+        self.output_estimator.add_text(text);
+        self.output_tokens = self.output_estimator.tokens();
+    }
+
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
         // 先过滤字面 <tool_use> XML 泄漏（跨 chunk）。过滤后为空可能是过滤器在缓冲
@@ -1729,7 +1738,7 @@ impl StreamContext {
         }
 
         // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        self.add_output_text(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -2250,7 +2259,7 @@ impl StreamContext {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
-                self.output_tokens += estimate_tokens(text);
+                self.add_output_text(text);
                 return self.create_text_delta_events(text);
             }
             return Vec::new();
@@ -2267,7 +2276,7 @@ impl StreamContext {
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
         {
-            self.output_tokens += estimate_tokens(text);
+            self.add_output_text(text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -2277,7 +2286,8 @@ impl StreamContext {
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
-            self.output_tokens += 8;
+            self.output_estimator.add_redacted_thinking();
+            self.output_tokens = self.output_estimator.tokens();
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2382,7 +2392,7 @@ impl StreamContext {
         ));
 
         // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
+        self.add_output_text(&completed.input.to_string());
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             block_index,
             json!({
@@ -2661,23 +2671,10 @@ impl StreamContext {
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
+    // 和输出估算同一口径：中文约 1.5 字符/token，英文约 4 字符/token
+    let mut estimator = crate::token::OutputTokenEstimator::default();
+    estimator.add_text(text);
+    estimator.tokens()
 }
 
 #[cfg(test)]

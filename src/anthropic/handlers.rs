@@ -1994,9 +1994,8 @@ pub async fn count_tokens(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// Claude Code 兼容端点。流式与 /v1/messages 共用即时流式处理：message_start 带按
+/// 请求估算做的缓存拆分，contextUsageEvent 换算的最终用量在 message_delta 里。
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,

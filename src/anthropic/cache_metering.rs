@@ -1131,8 +1131,6 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
-    /// 是否为当前轮次的最新用户提问（若是，在多轮对话中自动缓存不应打在其末尾，而应打在上一轮末尾）
-    is_current_turn_input: bool,
 }
 
 /// 识别出的断点
@@ -1159,7 +1157,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
-                is_current_turn_input: false,
             });
         }
     }
@@ -1176,7 +1173,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: !sys.text.trim().is_empty(),
                 lookback_group: None,
-                is_current_turn_input: false,
             });
         }
     }
@@ -1193,16 +1189,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
         .filter_map(|raw| serde_json::from_value::<CacheControl>(raw.clone()).ok())
         .filter(|cc| validated_ttl(cc).is_some())
         .last();
-    let total_messages = messages.len();
-    for (m_idx, msg) in messages.iter().enumerate() {
-        let is_tool_result = match &msg.content {
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
-            _ => false,
-        };
-        let is_current_turn_input =
-            (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
+    for msg in messages {
         match &msg.content {
             serde_json::Value::String(s) => {
                 let content = serde_json::Value::String(s.clone());
@@ -1213,7 +1200,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                     invalid_cache_control: false,
                     cacheable: !s.trim().is_empty(),
                     lookback_group: None,
-                    is_current_turn_input,
                 });
             }
             serde_json::Value::Array(arr) => {
@@ -1239,7 +1225,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         invalid_cache_control,
                         cacheable: block_is_cacheable(&content),
                         lookback_group,
-                        is_current_turn_input,
                     });
                 }
             }
@@ -1291,24 +1276,13 @@ fn resolve_breakpoints(
         }
     }
 
-    // 2. 顶层自动缓存：若有多轮对话且最后一条是当前 user 提问，断点优先挂在当前提问之前的上一轮会话末尾，
-    // 确保当前最新提问 100% 诚实作为未缓存 input_tokens，杜绝 input 归零。
+    // 2. 顶层自动缓存：和 Anthropic 一样，断点落在最后一个可缓存 block，包括当前这条
+    // user 提问。整份 prompt 都被覆盖时 input_tokens 为 0，这是官方的正常结果。
     if let Some(top_cc) = top_cache_control {
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = if blocks
-            .iter()
-            .any(|b| !b.is_current_turn_input && b.cacheable)
-        {
-            blocks
-                .iter()
-                .enumerate()
-                .rposition(|(_idx, block)| block.cacheable && !block.is_current_turn_input)
-        } else {
-            blocks.iter().rposition(|block| block.cacheable)
-        };
-        if let Some(last_idx) = target_idx {
+        if let Some(last_idx) = blocks.iter().rposition(|block| block.cacheable) {
             if let Some(existing) = breakpoints.iter().find(|bp| bp.block_idx == last_idx) {
                 if existing.ttl_secs != auto_ttl {
                     return Vec::new();

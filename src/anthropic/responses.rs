@@ -2337,7 +2337,7 @@ mod tests {
         assert_eq!(second.cache_read, first.cache_covered_est);
         assert!(
             second.cache_covered_est > second.cache_read,
-            "第二轮应读取旧前缀并写入新增历史，而不是把当前提问计入缓存"
+            "第二轮应读取上一轮的前缀，并把新增历史和当前提问写入缓存"
         );
     }
 

@@ -932,3 +932,98 @@ async fn gateway_invalid_breakpoint_on_prefill_keeps_metering() {
     assert!(creation > 0, "the system breakpoint is still metered");
     assert_same_split("invalid prefill breakpoint", &start, &delta);
 }
+
+async fn json_usage(state: AppState, endpoint: &str, mut req: serde_json::Value) -> serde_json::Value {
+    req["stream"] = json!(false);
+    let response = send_messages(state, endpoint, req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024).await.unwrap();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["usage"].clone()
+}
+
+/// 同时声明原生 web_search 和普通工具的请求走 web_search loop，不经过
+/// StreamContext。它的 message_start 也必须是缓存拆分：结尾 input=0 时，
+/// 下游会留下开头的值。
+#[tokio::test]
+async fn gateway_mixed_web_search_tools_report_the_same_split_at_start() {
+    for endpoint in ["messages", "cc"] {
+        let f = fixture(Mode::Simulated).await;
+        let state = metered(&f);
+        let mut req = chat_round(1, ephemeral());
+        req["tools"].as_array_mut().unwrap().push(json!({
+            "type": "web_search_20250305", "name": "web_search"
+        }));
+        for round in ["cold", "warm"] {
+            let (start, delta) =
+                stream_usage(send_messages(state.clone(), endpoint, req.clone()).await).await;
+            let delta = delta.expect("message_delta");
+            let at = format!("{endpoint} mixed tools {round}");
+            assert_same_split(&at, &start, &delta);
+            let [_, creation, read] = usage_split(&delta);
+            match round {
+                "cold" => assert!(creation > 0 && read == 0, "{at}: {delta}"),
+                _ => assert!(read > 0, "{at}: {delta}"),
+            }
+        }
+        assert_eq!(f.calls.load(Ordering::Relaxed), 2, "one upstream call per request");
+    }
+}
+
+/// 顶层自动缓存和 Anthropic 一样落在最后一个可缓存 block（包括当前 user），
+/// 结果与在那个 block 上显式打断点相同。
+#[tokio::test]
+async fn gateway_auto_cache_matches_explicit_breakpoint_on_last_block() {
+    for endpoint in ["messages", "cc"] {
+        let f = fixture(Mode::Simulated).await;
+        let automatic = json!({
+            "model": SIMULATED_MODEL, "max_tokens": 64,
+            "metadata": {"user_id": SESSION_USER_ID},
+            "cache_control": ephemeral(),
+            "system": "Stable system. ".repeat(100),
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Long reference document. ".repeat(1000)}
+            ]}]
+        });
+        let mut explicit = automatic.clone();
+        explicit.as_object_mut().unwrap().remove("cache_control");
+        explicit["messages"][0]["content"][0]["cache_control"] = ephemeral();
+        let (auto_state, explicit_state) = (metered(&f), metered(&f));
+        for round in ["cold", "warm"] {
+            let a = usage_split(&json_usage(auto_state.clone(), endpoint, automatic.clone()).await);
+            let e = usage_split(&json_usage(explicit_state.clone(), endpoint, explicit.clone()).await);
+            assert_eq!(a, e, "{endpoint} {round}");
+            assert_eq!(a[0], 0, "{endpoint} {round}: the whole prompt is covered");
+        }
+    }
+}
+
+/// 同样的输出、同样的 contextUsage，账不随流式事件分块变化，也和非流式估算一致。
+#[test]
+fn gateway_output_usage_is_independent_of_event_chunk_size() {
+    use crate::kiro::model::events::Event;
+    let content = "abcdefghijklmnopqrstuvwxyz 小熊 ".repeat(40);
+    let run = |chars_per_event: usize| {
+        let mut ctx = super::stream::StreamContext::new_with_thinking(
+            SIMULATED_MODEL, 1000, false, HashMap::new(), HashSet::new(),
+        );
+        ctx.generate_initial_events();
+        let chars: Vec<char> = content.chars().collect();
+        for chunk in chars.chunks(chars_per_event) {
+            let event = Event::AssistantResponse(
+                serde_json::from_value(json!({"content": chunk.iter().collect::<String>()})).unwrap(),
+            );
+            ctx.process_kiro_event(&event);
+        }
+        ctx.process_kiro_event(&Event::ContextUsage(
+            serde_json::from_value(json!({"contextUsagePercentage": 1.0})).unwrap(),
+        ));
+        let final_events = ctx.generate_final_events();
+        let usage = &final_events.iter().find(|e| e.event == "message_delta").unwrap().data["usage"];
+        (usage["input_tokens"].as_i64().unwrap(), usage["output_tokens"].as_i64().unwrap())
+    };
+    let whole = run(usize::MAX);
+    assert_eq!(whole, run(1), "one character per event");
+    assert_eq!(whole, run(7), "seven characters per event");
+    let non_stream = crate::token::estimate_output_tokens(&[json!({"type": "text", "text": content})]);
+    assert_eq!(whole.1, non_stream as i64);
+}

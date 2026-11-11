@@ -1161,7 +1161,14 @@ where
     result
 }
 
-fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
+/// 流式 web_search loop 的 message_start。
+///
+/// usage 按首轮的 CacheMeter 结果做和 message_delta 相同的拆分。下游（如 new-api）
+/// 只在 message_delta 的字段大于 0 时才覆盖开头的值：开头若报未拆分的估算 input，
+/// 结尾报 input=0 时估算值会留下来被重复计费。
+fn initial_stream_event(model: &str, input_tokens: i32, cache_usage: CacheUsage) -> SseEvent {
+    let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) =
+        cache_usage.split_against_total(input_tokens);
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
     SseEvent::new(
         "message_start",
@@ -1176,10 +1183,10 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": input_tokens.max(0),
+                    "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens
                 }
             }
         }),
@@ -1373,6 +1380,7 @@ pub(super) async fn run_web_search_loop(
             cache_meter,
             key_id,
             None,
+            None,
         )
         .await;
     }
@@ -1383,7 +1391,16 @@ pub(super) async fn run_web_search_loop(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
+    // 首轮缓存在这里算一次并传进 loop：再算一次会把本请求刚写入的断点当成命中。
+    let first_round_cache_usage = match cache_meter.as_ref() {
+        Some(cache) => super::cache_metering::compute_cache_usage(cache, &payload, key_id).await,
+        None => CacheUsage::default(),
+    };
+    let initial_event = initial_stream_event(
+        &payload.model,
+        initial_input_tokens,
+        first_round_cache_usage,
+    );
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
@@ -1403,6 +1420,7 @@ pub(super) async fn run_web_search_loop(
                 tool_compatibility_mode,
                 cache_meter,
                 key_id,
+                Some(first_round_cache_usage),
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1445,6 +1463,7 @@ async fn run_web_search_loop_inner(
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
+    mut first_round_cache_usage: Option<CacheUsage>,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
@@ -1461,11 +1480,12 @@ async fn run_web_search_loop_inner(
                 payload.messages.clone(),
                 payload.tools.clone(),
             ) as i32;
-            let round_cache_usage = match cache_meter.as_ref() {
-                Some(cache) => {
+            let round_cache_usage = match (first_round_cache_usage.take(), cache_meter.as_ref()) {
+                (Some(usage), _) => usage,
+                (None, Some(cache)) => {
                     super::cache_metering::compute_cache_usage(cache, &payload, key_id).await
                 }
-                None => CacheUsage::default(),
+                (None, None) => CacheUsage::default(),
             };
             let (round, credential_id) = match run_round(
                 &provider,
@@ -1980,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn channel_response_exposes_message_start_before_background_progress() {
         let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
-        let response = render_channel_sse(initial_stream_event("gpt-5.6-sol", 17), receiver);
+        let response = render_channel_sse(initial_stream_event("gpt-5.6-sol", 17, CacheUsage::default()), receiver);
         let mut body = response.into_body().into_data_stream();
 
         let first = tokio::time::timeout(Duration::from_millis(100), body.next())
@@ -3167,12 +3187,12 @@ mod tests {
             }
         );
 
-        let mut fallback_round = round_outcome("fallback output", vec![]);
+        let mut fallback_round = round_outcome("fallback output text", vec![]);
         fallback_round.context_input_tokens = Some(20);
         let (fallback_usage, fallback_source) =
             fallback_round.resolved_token_usage(500, CacheUsage::default());
         assert_eq!(fallback_source, UsageSource::None);
-        // "fallback output" = 15 个西文字符 → count_tokens 得 5 个输出 token。
+        // "fallback output text" = 20 个西文字符 → 输出估算得 5 个 token。
         assert_eq!(fallback_usage.output_tokens, 5);
         // context 20 - output 5 = 15。
         assert_eq!(fallback_usage.uncached_input_tokens, 15);
@@ -3190,7 +3210,7 @@ mod tests {
 
     #[test]
     fn round_usage_without_context_usage_does_not_subtract_output() {
-        let round = round_outcome("fallback output", vec![]);
+        let round = round_outcome("fallback output text", vec![]);
         // round_outcome 辅助函数默认不带 contextUsage。
         assert_eq!(round.context_input_tokens, None);
 
@@ -3203,11 +3223,11 @@ mod tests {
 
     #[test]
     fn multiple_fallback_rounds_each_subtract_their_own_output() {
-        // 两轮都走 contextUsage 回退分支，输出文本相同（"fallback output"
-        // = 15 个西文字符 → count_tokens 得 5 个输出 token），contextUsage 不同。
-        let mut round_a = round_outcome("fallback output", vec![]);
+        // 两轮都走 contextUsage 回退分支，输出文本相同（"fallback output text"
+        // = 20 个西文字符 → 输出估算得 5 个 token），contextUsage 不同。
+        let mut round_a = round_outcome("fallback output text", vec![]);
         round_a.context_input_tokens = Some(20);
-        let mut round_b = round_outcome("fallback output", vec![]);
+        let mut round_b = round_outcome("fallback output text", vec![]);
         round_b.context_input_tokens = Some(30);
 
         let (usage_a, source_a) = round_a.resolved_token_usage(500, CacheUsage::default());
@@ -3237,7 +3257,7 @@ mod tests {
 
     #[test]
     fn fallback_round_splits_total_with_cache_metering() {
-        let mut round = round_outcome("fallback output", vec![]);
+        let mut round = round_outcome("fallback output text", vec![]);
         round.context_input_tokens = Some(105);
         let cache_usage = CacheUsage {
             cache_read: 60,
